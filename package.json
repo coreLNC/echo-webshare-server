@@ -1,0 +1,17 @@
+{
+  "name": "echo-webshare-server",
+  "version": "1.0.0",
+  "description": "WebSocket signaling server for Echo WebShare",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "David Ayobami Okeleye",
+  "license": "SEE LICENSE IN LICENSE",
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
