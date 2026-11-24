@@ -11,6 +11,9 @@ const PORT = process.env.PORT || 8080;
 const MAX_MESSAGE_BYTES = Number(process.env.MAX_MESSAGE_BYTES || 16 * 1024 * 1024);
 const MAX_MEDIA_BYTES = Number(process.env.MAX_MEDIA_BYTES || 8 * 1024 * 1024);
 
+// Optional invite secret required to create rooms. Gate is off when unset.
+const ROOM_SECRET = process.env.ROOM_SECRET || '';
+
 const clients = new Map();
 const rooms = new Map();
 
@@ -56,6 +59,19 @@ function getDataUrlSize(dataUrl) {
   return Math.max(0, Math.floor((payload.length * 3) / 4) - padding);
 }
 
+function secretMatches(provided) {
+  if (!ROOM_SECRET) return true;
+  const a = Buffer.from(String(provided || ''));
+  const b = Buffer.from(ROOM_SECRET);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function inSameRoom(clientId, targetId) {
+  const sender = clients.get(clientId);
+  const target = clients.get(targetId);
+  return !!(sender?.roomCode && target && target.roomCode === sender.roomCode);
+}
+
 function cleanupClient(clientId) {
   const ws = clients.get(clientId);
 
@@ -87,12 +103,16 @@ const wss = new WebSocket.Server({
   maxPayload: MAX_MESSAGE_BYTES
 });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   const clientId = generateId();
   clients.set(clientId, ws);
   ws.clientId = clientId;
   ws.roomCode = null;
   ws.isAlive = true;
+  // Only trust x-forwarded-for when running behind a proxy you control.
+  ws.ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
+    .split(',')[0]
+    .trim();
 
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -121,9 +141,119 @@ wss.on('connection', (ws) => {
   });
 });
 
+/* ---------------- TURN credential issuance (Cloudflare Realtime) ---------------- */
+
+const TURN_TTL_SECONDS = 3600;
+const TURN_WINDOW_MS = 60_000;
+const TURN_SOCKET_COOLDOWN_MS = 60_000;
+const TURN_PER_IP = 10;
+const TURN_GLOBAL = 120;
+
+const turnByIp = new Map();
+let turnGlobal = { start: 0, count: 0 };
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of turnByIp) {
+    if (now - entry.start >= TURN_WINDOW_MS) turnByIp.delete(ip);
+  }
+}, TURN_WINDOW_MS).unref();
+
+function allowTurnRequest(ws, now) {
+  if (now < (ws.nextTurnRequestAt ?? 0)) return false;
+
+  if (now - turnGlobal.start >= TURN_WINDOW_MS) turnGlobal = { start: now, count: 0 };
+  if (turnGlobal.count >= TURN_GLOBAL) return false;
+
+  const ip = ws.ip || 'unknown';
+  let entry = turnByIp.get(ip);
+  if (!entry || now - entry.start >= TURN_WINDOW_MS) {
+    entry = { start: now, count: 0 };
+    turnByIp.set(ip, entry);
+  }
+  if (entry.count >= TURN_PER_IP) return false;
+
+  entry.count++;
+  turnGlobal.count++;
+  ws.nextTurnRequestAt = now + TURN_SOCKET_COOLDOWN_MS;
+  return true;
+}
+
+async function sendTurnCredentials(ws, clientId) {
+  const roomCode = ws.roomCode;
+  const room = rooms.get(roomCode);
+  const isStillInRoom = () =>
+    clients.get(clientId) === ws &&
+    ws.roomCode === roomCode &&
+    room &&
+    rooms.get(roomCode) === room &&
+    (room.hostId === clientId || room.viewers.has(clientId));
+
+  const replyError = (message) =>
+    send(clientId, { type: 'turn-credentials-error', message });
+
+  if (!isStillInRoom()) {
+    replyError('Create or join a room before requesting TURN credentials.');
+    return;
+  }
+
+  const keyId = process.env.TURN_KEY_ID;
+  const apiToken = process.env.TURN_KEY_API_TOKEN;
+  if (!keyId || !apiToken) {
+    replyError('TURN is not configured.');
+    return;
+  }
+
+  if (!allowTurnRequest(ws, Date.now())) {
+    replyError('Too many TURN requests. Try again shortly.');
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ ttl: TURN_TTL_SECONDS }),
+        signal: AbortSignal.timeout(5000)
+      }
+    );
+
+    if (!response.ok) throw new Error(`TURN provider returned ${response.status}`);
+
+    const { iceServers } = await response.json();
+    if (!Array.isArray(iceServers) || iceServers.length === 0) {
+      throw new Error('TURN provider returned no ICE servers');
+    }
+
+    if (isStillInRoom()) {
+      send(clientId, {
+        type: 'turn-credentials',
+        iceServers,
+        ttlSeconds: TURN_TTL_SECONDS
+      });
+    }
+  } catch {
+    ws.nextTurnRequestAt = 0; // allow an immediate retry after a failure
+    console.warn('TURN credential request failed.');
+    if (isStillInRoom()) replyError('Could not get TURN credentials.');
+  }
+}
+
+/* ---------------- Message handling ---------------- */
+
 function handleMessage(ws, clientId, msg) {
   switch (msg.type) {
     case 'create-room': {
+      if (!secretMatches(msg.secret)) {
+        send(clientId, { type: 'error', message: 'Not authorized to create rooms' });
+        return;
+      }
+
       if (ws.roomCode) {
         handleMessage(ws, clientId, { type: 'leave-room' });
       }
@@ -194,16 +324,26 @@ function handleMessage(ws, clientId, msg) {
       break;
     }
 
+    case 'request-turn-credentials':
+      void sendTurnCredentials(ws, clientId);
+      break;
+
     case 'offer':
-      send(msg.target, { type: 'offer', from: clientId, offer: msg.offer });
+      if (inSameRoom(clientId, msg.target)) {
+        send(msg.target, { type: 'offer', from: clientId, offer: msg.offer });
+      }
       break;
 
     case 'answer':
-      send(msg.target, { type: 'answer', from: clientId, answer: msg.answer });
+      if (inSameRoom(clientId, msg.target)) {
+        send(msg.target, { type: 'answer', from: clientId, answer: msg.answer });
+      }
       break;
 
     case 'ice-candidate':
-      send(msg.target, { type: 'ice-candidate', from: clientId, candidate: msg.candidate });
+      if (inSameRoom(clientId, msg.target)) {
+        send(msg.target, { type: 'ice-candidate', from: clientId, candidate: msg.candidate });
+      }
       break;
 
     case 'chat': {
