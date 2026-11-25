@@ -144,6 +144,8 @@ wss.on('connection', (ws, req) => {
 /* ---------------- TURN credential issuance (Cloudflare Realtime) ---------------- */
 
 const TURN_TTL_SECONDS = 3600;
+// Metered credentials are static per app, so we cache them briefly server-side.
+const METERED_CACHE_MS = 10 * 60_000;
 const TURN_WINDOW_MS = 60_000;
 const TURN_SOCKET_COOLDOWN_MS = 60_000;
 const TURN_PER_IP = 10;
@@ -151,6 +153,60 @@ const TURN_GLOBAL = 120;
 
 const turnByIp = new Map();
 let turnGlobal = { start: 0, count: 0 };
+let meteredCache = { iceServers: null, expiresAt: 0 };
+
+// Which TURN provider is configured: 'metered', 'cloudflare', or null.
+function turnProvider() {
+  if (process.env.METERED_DOMAIN && process.env.METERED_API_KEY) return 'metered';
+  if (process.env.TURN_KEY_ID && process.env.TURN_KEY_API_TOKEN) return 'cloudflare';
+  return null;
+}
+
+async function fetchIceServers() {
+  if (turnProvider() === 'metered') {
+    if (meteredCache.iceServers && Date.now() < meteredCache.expiresAt) {
+      return { iceServers: meteredCache.iceServers, ttlSeconds: Math.floor(METERED_CACHE_MS / 1000) };
+    }
+
+    // Accept "myapp" or "myapp.metered.live"
+    const app = process.env.METERED_DOMAIN.replace(/\.metered\.live$/i, '').trim();
+    if (!/^[a-z0-9_-]+$/i.test(app)) throw new Error('Invalid METERED_DOMAIN');
+
+    const response = await fetch(
+      `https://${app}.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(process.env.METERED_API_KEY)}`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (!response.ok) throw new Error(`TURN provider returned ${response.status}`);
+
+    const iceServers = await response.json(); // Metered returns a bare array
+    if (!Array.isArray(iceServers) || iceServers.length === 0) {
+      throw new Error('TURN provider returned no ICE servers');
+    }
+
+    meteredCache = { iceServers, expiresAt: Date.now() + METERED_CACHE_MS };
+    return { iceServers, ttlSeconds: Math.floor(METERED_CACHE_MS / 1000) };
+  }
+
+  const response = await fetch(
+    `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(process.env.TURN_KEY_ID)}/credentials/generate-ice-servers`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.TURN_KEY_API_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ ttl: TURN_TTL_SECONDS }),
+      signal: AbortSignal.timeout(5000)
+    }
+  );
+  if (!response.ok) throw new Error(`TURN provider returned ${response.status}`);
+
+  const { iceServers } = await response.json();
+  if (!Array.isArray(iceServers) || iceServers.length === 0) {
+    throw new Error('TURN provider returned no ICE servers');
+  }
+  return { iceServers, ttlSeconds: TURN_TTL_SECONDS };
+}
 
 setInterval(() => {
   const now = Date.now();
@@ -197,9 +253,7 @@ async function sendTurnCredentials(ws, clientId) {
     return;
   }
 
-  const keyId = process.env.TURN_KEY_ID;
-  const apiToken = process.env.TURN_KEY_API_TOKEN;
-  if (!keyId || !apiToken) {
+  if (!turnProvider()) {
     replyError('TURN is not configured.');
     return;
   }
@@ -210,32 +264,10 @@ async function sendTurnCredentials(ws, clientId) {
   }
 
   try {
-    const response = await fetch(
-      `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiToken}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ ttl: TURN_TTL_SECONDS }),
-        signal: AbortSignal.timeout(5000)
-      }
-    );
-
-    if (!response.ok) throw new Error(`TURN provider returned ${response.status}`);
-
-    const { iceServers } = await response.json();
-    if (!Array.isArray(iceServers) || iceServers.length === 0) {
-      throw new Error('TURN provider returned no ICE servers');
-    }
+    const { iceServers, ttlSeconds } = await fetchIceServers();
 
     if (isStillInRoom()) {
-      send(clientId, {
-        type: 'turn-credentials',
-        iceServers,
-        ttlSeconds: TURN_TTL_SECONDS
-      });
+      send(clientId, { type: 'turn-credentials', iceServers, ttlSeconds });
     }
   } catch {
     ws.nextTurnRequestAt = 0; // allow an immediate retry after a failure
